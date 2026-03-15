@@ -1,46 +1,104 @@
-package main // Каждый проект на Go начинается с пакета main - это точка входа в программу
+package main
 
 import (
-	"encoding/json" // Пакет для работы с форматом JSON (в нем общаются API)
-	"fmt"           // Пакет для форматированного вывода текста (например, в консоль)
-	"net/http"      // Встроенный в Go пакет для создания веб-сервера
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sync"
+	"time"
 )
 
-// Info — это структура (как класс или объект), описывающая данные, которые мы будем отдавать.
-// В обратных кавычках `json:"id"` мы говорим, как это поле будет называться в JSON-ответе.
-type Info struct {
-	ID      int    `json:"id"`
-	Title   string `json:"title"`
-	Message string `json:"message"`
+// Message — структура нашего сообщения в чате
+type Message struct {
+	User      string `json:"user"`      // Кто отправил
+	Text      string `json:"text"`      // Текст сообщения
+	Timestamp string `json:"timestamp"` // Время отправки
+}
+
+// ChatServer — структура, которая хранит все наши чат-комнаты
+type ChatServer struct {
+	// mu — это тот самый "замок" (мьютекс) для многопоточности. 
+	// Он защищает память, когда несколько пользователей пишут одновременно.
+	mu       sync.Mutex 
+	// messages — это словарь. Ключ (строка) — название комнаты, а значение — список сообщений.
+	messages map[string][]Message
+}
+
+// Создаем наш сервер (пока он пустой)
+var chat = ChatServer{
+	messages: make(map[string][]Message),
+}
+
+// Функция, которая обрабатывает запросы к чату
+func chatHandler(w http.ResponseWriter, r *http.Request) {
+	// 1. АУТЕНТИФИКАЦИЯ
+	// Читаем заголовок X-Nickname. Это наш способ узнать, кто пришел (без сложного логина)
+	nickname := r.Header.Get("X-Nickname")
+	if nickname == "" {
+		// Если ника нет, возвращаем ошибку 401 (Не авторизован)
+		http.Error(w, "Ошибка: Добавь заголовок X-Nickname", http.StatusUnauthorized)
+		return
+	}
+
+	// 2. ВЫБОР КОМНАТЫ
+	// Берем название комнаты из ссылки, например /chat?room=univer
+	room := r.URL.Query().Get("room")
+	if room == "" {
+		room = "general" // Если комната не указана, кидаем всех в общую
+	}
+
+	// 3. ЕСЛИ ЭТО GET-ЗАПРОС (Чтение сообщений)
+	if r.Method == http.MethodGet {
+		chat.mu.Lock()                     // Закрываем замок (чтобы никто не добавил сообщение, пока мы читаем)
+		roomMessages := chat.messages[room] // Берем сообщения нужной комнаты
+		chat.mu.Unlock()                   // Открываем замок
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(roomMessages) // Отправляем сообщения в виде JSON
+		return
+	}
+
+	// 4. ЕСЛИ ЭТО POST-ЗАПРОС (Отправка сообщения)
+	if r.Method == http.MethodPost {
+		// Создаем временную структуру для чтения текста из запроса
+		var input struct {
+			Text string `json:"text"`
+		}
+		
+		// Читаем то, что пользователь прислал в теле запроса (Body)
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "Ошибка чтения сообщения", http.StatusBadRequest)
+			return
+		}
+
+		// Формируем готовое сообщение
+		msg := Message{
+			User:      nickname,
+			Text:      input.Text,
+			Timestamp: time.Now().Format("15:04:05"), // Форматируем время в часы:минуты:секунды
+		}
+
+		// Сохраняем сообщение
+		chat.mu.Lock() // Снова закрываем замок перед изменением памяти!
+		chat.messages[room] = append(chat.messages[room], msg) // Добавляем сообщение в список комнаты
+		chat.mu.Unlock() // Открываем замок
+
+		w.WriteHeader(http.StatusCreated) // Отвечаем статусом 201 (Создано)
+		fmt.Fprintln(w, "Сообщение отправлено в комнату", room)
+		return
+	}
+
+	// Если метод не GET и не POST
+	http.Error(w, "Используйте GET для чтения или POST для отправки", http.StatusMethodNotAllowed)
 }
 
 func main() {
-	// 1. Создаем первый "эндпоинт" (путь). Это просто главная страница.
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// w - это то, что мы отвечаем (Write). r - это запрос от клиента (Read/Request).
-		fmt.Fprintln(w, "Привет! Мое АПИ работает.")
-	})
+	// Регистрируем наш обработчик по адресу /chat
+	http.HandleFunc("/chat", chatHandler)
 
-	// 2. Создаем путь "/api/data", который будет отдавать информацию в формате JSON.
-	http.HandleFunc("/api/data", func(w http.ResponseWriter, r *http.Request) {
-		// Говорим браузеру или Postman, что мы возвращаем именно JSON, а не просто текст
-		w.Header().Set("Content-Type", "application/json")
-
-		// Создаем немного фейковых данных (массив из структур Info)
-		data :=[]Info{
-			{ID: 1, Title: "Универ", Message: "Завтра нужно показать этот код"},
-			{ID: 2, Title: "Go", Message: "Оказывается, писать АПИ на Go довольно просто"},
-		}
-
-		// Превращаем наши данные в JSON и отправляем клиенту (в w)
-		json.NewEncoder(w).Encode(data)
-	})
-
-	// 3. Запускаем сервер на порту 8080
-	fmt.Println("Сервер запущен... Открой http://localhost:8080 в браузере или Postman")
-	// http.ListenAndServe "слушает" порт и держит сервер включенным
+	fmt.Println("Сервер чата запущен на http://localhost:8080")
 	err := http.ListenAndServe(":8080", nil)
 	if err != nil {
-		fmt.Println("Ошибка запуска сервера:", err)
+		fmt.Println("Ошибка:", err)
 	}
 }
